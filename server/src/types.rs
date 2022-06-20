@@ -8,6 +8,7 @@ use anyhow::Context;
 use deno_core::futures;
 use derive_new::new;
 use futures::StreamExt;
+use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -66,7 +67,7 @@ fn string_field(name: &str) -> Field {
     Field {
         id: None,
         name: name.into(),
-        type_: Type::String,
+        type_: TypeId::String,
         labels: vec![],
         default: None,
         effective_default: None,
@@ -86,7 +87,7 @@ fn optional_number_field(name: &str) -> Field {
     Field {
         id: None,
         name: name.into(),
-        type_: Type::Float,
+        type_: TypeId::Float,
         labels: vec![],
         default: None,
         effective_default: None,
@@ -484,6 +485,7 @@ impl TypeSystem {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Type {
     String,
@@ -501,6 +503,37 @@ impl Type {
             Type::String => "string",
             Type::Boolean => "boolean",
             Type::Object(ty) => &ty.name,
+        }
+    }
+
+    pub(crate) fn id(&self) -> TypeId {
+        match self {
+            Type::String => TypeId::String,
+            Type::Float => TypeId::Float,
+            Type::Boolean => TypeId::Boolean,
+            Type::Id => TypeId::Id,
+            Type::Object(ty) => TypeId::Object(ty.name.clone()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub enum TypeId {
+    String,
+    Float,
+    Boolean,
+    Id,
+    Object(String),
+}
+
+impl TypeId {
+    pub(crate) fn name(&self) -> &str {
+        match self {
+            TypeId::Float => "number",
+            TypeId::Id => "string",
+            TypeId::String => "string",
+            TypeId::Boolean => "boolean",
+            TypeId::Object(ref name) => name,
         }
     }
 }
@@ -703,7 +736,7 @@ impl ObjectType {
         let chisel_id = Field {
             id: None,
             name: "id".to_string(),
-            type_: Type::Id,
+            type_: TypeId::Id,
             labels: Vec::default(),
             default: None,
             effective_default: None,
@@ -937,7 +970,7 @@ impl<'a> FieldDescriptor for NewField<'a> {
 pub(crate) struct Field {
     pub(crate) id: Option<i32>,
     pub(crate) name: String,
-    pub(crate) type_: Type,
+    pub(crate) type_: TypeId,
     pub(crate) labels: Vec<String>,
     pub(crate) is_optional: bool,
     pub(crate) is_unique: bool,
@@ -974,7 +1007,7 @@ impl Field {
         Self {
             id: desc.id(),
             name: desc.name(),
-            type_: desc.ty(),
+            type_: desc.ty().id(),
             api_version: desc.api_version(),
             labels,
             default,
@@ -994,7 +1027,7 @@ impl Field {
 
     pub(crate) fn generate_value(&self) -> Option<String> {
         match self.type_ {
-            Type::Id => Some(Uuid::new_v4().to_string()),
+            TypeId::Id => Some(Uuid::new_v4().to_string()),
             _ => self.default.clone(),
         }
     }
@@ -1011,7 +1044,7 @@ impl Field {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct FieldAttrDelta {
-    pub(crate) type_: Type,
+    pub(crate) type_: TypeId,
     pub(crate) default: Option<String>,
     pub(crate) is_optional: bool,
     pub(crate) is_unique: bool,

@@ -526,7 +526,12 @@ async fn op_chisel_store(
     };
     let mut transaction = transaction.lock().await;
     query_engine
-        .add_row(&ty, value, Some(transaction.deref_mut()))
+        .add_row(
+            &ty,
+            value,
+            Some(transaction.deref_mut()),
+            current_type_system(&state.borrow()),
+        )
         .await
 }
 
@@ -586,6 +591,7 @@ async fn op_chisel_crud_delete(
             ),
             &params.type_name,
             &params.url,
+            &current_type_system(&state.borrow()),
         )
         .context(
             "failed to construct delete expression from JSON passed to `op_chisel_crud_delete`",
@@ -641,16 +647,14 @@ async fn op_chisel_crud_query(
         let op_state = &state.borrow();
         let transaction = current_transaction(op_state);
         let query_engine = query_engine_arc(op_state);
+        let type_system = current_type_system(op_state);
 
         crud::run_query(
-            &RequestContext::new(
-                current_policies(op_state),
-                current_type_system(op_state),
-                context,
-            ),
+            &RequestContext::new(current_policies(op_state), &type_system, context),
             params,
             query_engine,
             transaction,
+            &type_system,
         )
     }
     .await

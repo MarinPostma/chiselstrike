@@ -3,7 +3,7 @@
 use crate::auth::AUTH_USER_NAME;
 use crate::datastore::expr::{BinaryExpr, Expr, Literal, PropertyAccess};
 use crate::policies::{FieldPolicies, Policies};
-use crate::types::{Field, ObjectType, Type, TypeSystem};
+use crate::types::{Field, ObjectType, Type, TypeId, TypeSystem};
 
 use anyhow::{anyhow, Context, Result};
 use enum_as_inner::EnumAsInner;
@@ -58,7 +58,7 @@ pub(crate) enum QueryField {
         /// Name of the original Type field
         name: String,
         /// Type of the field
-        type_: Type,
+        type_: TypeId,
         is_optional: bool,
         /// Index of a column containing this field in the resulting row we get from
         /// the database.
@@ -253,7 +253,7 @@ impl QueryPlan {
         for field in ty.all_fields() {
             let mut field = field.clone();
             field.type_ = match field.type_ {
-                Type::Object(_) => Type::String, // This is actually a foreign key.
+                TypeId::Object(_) => TypeId::String, // This is actually a foreign key.
                 ty => ty,
             };
             let field = builder.make_scalar_field(&field, ty.backing_table(), None);
@@ -358,7 +358,12 @@ impl QueryPlan {
         for field in ty.all_fields() {
             let field_policy = field_policies.transforms.get(&field.name).cloned();
 
-            let query_field = if let Type::Object(nested_ty) = &field.type_ {
+            let nested_ty = context
+                .ts
+                .lookup_type(field.type_.name(), &ty.api_version)
+                .unwrap();
+
+            let query_field = if let Type::Object(nested_ty) = nested_ty {
                 let nested_table = format!(
                     "JOIN{}_{}_TO_{}",
                     self.join_counter,
@@ -373,7 +378,7 @@ impl QueryPlan {
                 joins.insert(
                     field.name.to_owned(),
                     Join {
-                        entity: self.load_entity_recursive(context, nested_ty, &nested_table),
+                        entity: self.load_entity_recursive(context, &nested_ty, &nested_table),
                         lkey: field.name.to_owned(),
                         rkey: "id".to_owned(),
                     },
@@ -412,7 +417,11 @@ impl QueryPlan {
         .into();
 
         for field in ty.all_fields() {
-            if let Type::Object(nested_ty) = &field.type_ {
+            let nested_ty = context
+                .ts
+                .lookup_type(field.type_.name(), &ty.api_version)
+                .unwrap();
+            if let Type::Object(nested_ty) = nested_ty {
                 let property_access = PropertyAccess {
                     property: field.name.to_owned(),
                     object: property_chain.clone().into(),
@@ -423,7 +432,7 @@ impl QueryPlan {
                         self.operators.push(QueryOp::Filter { expression: expr });
                     }
                 } else {
-                    self.add_login_filters_recursive(context, nested_ty, property_access.into());
+                    self.add_login_filters_recursive(context, &nested_ty, property_access.into());
                 }
             }
         }
@@ -891,13 +900,17 @@ pub(crate) mod tests {
         query_engine: &QueryEngine,
         entity: &Arc<ObjectType>,
         values: &serde_json::Value,
+        type_system: &TypeSystem,
     ) {
         let ins_row = values.as_object().unwrap();
-        query_engine.add_row(entity, ins_row, None).await.unwrap();
+        query_engine
+            .add_row(entity, ins_row, None, type_system)
+            .await
+            .unwrap();
         let rows = fetch_rows(query_engine, entity).await;
         assert!(rows.iter().any(|row| {
             ins_row.iter().all(|(key, value)| {
-                if let Type::Object(_) = entity.get_field(key).unwrap().type_ {
+                if let TypeId::Object(_) = entity.get_field(key).unwrap().type_ {
                     true
                 } else {
                     row[key] == *value
@@ -973,7 +986,7 @@ pub(crate) mod tests {
         {
             let (qe, _db_file) = setup_clear_db(&*ENTITIES).await;
             for person in ppl {
-                add_row(&qe, &PERSON_TY, &person).await;
+                add_row(&qe, &PERSON_TY, &person, &TS).await;
             }
             let make_sort_op = |keys: &[(&str, bool)]| {
                 let keys = keys
@@ -1031,7 +1044,7 @@ pub(crate) mod tests {
         let alan = json!({"name": "Alan", "age": json!(30f32)});
         {
             let (qe, _db_file) = setup_clear_db(&*ENTITIES).await;
-            add_row(&qe, &PERSON_TY, &john).await;
+            add_row(&qe, &PERSON_TY, &john, &TS).await;
 
             let expr = binary(&["name"], BinaryOp::Eq, "John".into());
             let mutation = delete_with_expr("Person", expr);
@@ -1041,8 +1054,8 @@ pub(crate) mod tests {
         }
         {
             let (qe, _db_file) = setup_clear_db(&*ENTITIES).await;
-            add_row(&qe, &PERSON_TY, &john).await;
-            add_row(&qe, &PERSON_TY, &alan).await;
+            add_row(&qe, &PERSON_TY, &john, &TS).await;
+            add_row(&qe, &PERSON_TY, &alan, &TS).await;
 
             let expr = binary(&["age"], BinaryOp::Eq, (30.).into());
             let mutation = delete_with_expr("Person", expr);
@@ -1056,7 +1069,7 @@ pub(crate) mod tests {
         let chiselstrike = json!({"name": "ChiselStrike", "ceo": john});
         {
             let (qe, _db_file) = setup_clear_db(&*ENTITIES).await;
-            add_row(&qe, &COMPANY_TY, &chiselstrike).await;
+            add_row(&qe, &COMPANY_TY, &chiselstrike, &TS).await;
 
             let expr = binary(&["ceo", "name"], BinaryOp::Eq, "John".into());
             let mutation = delete_with_expr("Company", expr);

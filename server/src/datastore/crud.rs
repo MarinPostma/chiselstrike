@@ -1,7 +1,7 @@
 use crate::datastore::engine::{QueryEngine, TransactionStatic};
 use crate::datastore::expr::{BinaryExpr, BinaryOp, Expr, Literal, PropertyAccess};
 use crate::datastore::query::{Mutation, QueryOp, QueryPlan, RequestContext, SortBy, SortKey};
-use crate::types::{ObjectType, Type};
+use crate::types::{ObjectType, Type, TypeSystem};
 use crate::JsonObject;
 use anyhow::{Context, Result};
 use deno_core::futures;
@@ -24,8 +24,9 @@ pub(crate) fn run_query(
     params: QueryParams,
     query_engine: Arc<QueryEngine>,
     tr: TransactionStatic,
+    type_system: &TypeSystem,
 ) -> impl Future<Output = Result<JsonObject>> {
-    let fut = run_query_impl(context, params, query_engine, tr);
+    let fut = run_query_impl(context, params, query_engine, tr, type_system);
     async move { fut?.await }
 }
 
@@ -34,6 +35,7 @@ fn run_query_impl(
     params: QueryParams,
     query_engine: Arc<QueryEngine>,
     tr: TransactionStatic,
+    type_system: &TypeSystem,
 ) -> Result<impl Future<Output = Result<JsonObject>>> {
     let host = context.headers.get("host").cloned();
     let base_type = &context
@@ -41,7 +43,7 @@ fn run_query_impl(
         .lookup_object_type(&params.type_name, &context.api_version)
         .context("unexpected type name as crud query base type")?;
 
-    let query = Query::from_url(base_type, &params.url)?;
+    let query = Query::from_url(base_type, &params.url, type_system)?;
     let ops = query.make_query_ops()?;
     let query_plan = QueryPlan::from_ops(context, base_type, ops)?;
     let stream = query_engine.query(tr.clone(), query_plan)?;
@@ -172,13 +174,18 @@ fn make_page_url(url: &Url, host: &Option<String>, cursor: &Cursor) -> Result<Ur
 }
 
 /// Constructs Delete Mutation from CRUD url.
-pub(crate) fn delete_from_url(c: &RequestContext, type_name: &str, url: &str) -> Result<Mutation> {
+pub(crate) fn delete_from_url(
+    c: &RequestContext,
+    type_name: &str,
+    url: &str,
+    type_system: &TypeSystem,
+) -> Result<Mutation> {
     let base_entity = match c.ts.lookup_type(type_name, &c.api_version) {
         Ok(Type::Object(ty)) => ty,
         Ok(ty) => anyhow::bail!("Cannot delete scalar type {type_name} ({})", ty.name()),
         Err(_) => anyhow::bail!("Cannot delete from type `{type_name}`, type not found"),
     };
-    let filter_expr = url_to_filter(&base_entity, url)
+    let filter_expr = url_to_filter(&base_entity, url, type_system)
         .context("failed to convert crud URL to filter expression")?;
     if filter_expr.is_none() {
         let q = Url::parse(url).with_context(|| format!("failed to parse query string '{url}'"))?;
@@ -219,7 +226,7 @@ impl Query {
     }
 
     /// Parses provided `url` and builds a `Query` that can be used to build a `QueryPlan`.
-    fn from_url(base_type: &Arc<ObjectType>, url: &Url) -> Result<Self> {
+    fn from_url(base_type: &Arc<ObjectType>, url: &Url, type_system: &TypeSystem) -> Result<Self> {
         let mut q = Query::new();
         for (param_key, value) in url.query_pairs().into_owned() {
             match param_key.as_str() {
@@ -245,8 +252,8 @@ impl Query {
                 }
                 _ => {
                     if let Some(param_key) = param_key.strip_prefix('.') {
-                        let expr =
-                            filter_from_param(base_type, param_key, &value).with_context(|| {
+                        let expr = filter_from_param(base_type, param_key, &value, type_system)
+                            .with_context(|| {
                                 format!("failed to parse filter {param_key}={value}")
                             })?;
                         q.filters.push(expr);
@@ -258,7 +265,7 @@ impl Query {
         ensure_sort_by_id(&mut q.sort);
         if let Some(cursor) = &q.cursor {
             q.sort = cursor.get_sort();
-            q.filters.push(cursor.get_filter(base_type)?);
+            q.filters.push(cursor.get_filter(base_type, type_system)?);
         }
         Ok(q)
     }
@@ -353,7 +360,7 @@ impl Cursor {
     /// The crux of this function is using the sort axes (each axis represents one dimension
     /// in lexicographical sort) to create a filter that filters for entries that are after
     /// the last element in the given sort.
-    fn get_filter(&self, base_type: &Arc<ObjectType>) -> Result<Expr> {
+    fn get_filter(&self, base_type: &Arc<ObjectType>, type_system: &TypeSystem) -> Result<Expr> {
         let mut cmp_pairs: Vec<(Expr, BinaryOp, Expr)> = vec![];
         for axis in &self.axes {
             let op = if axis.key.ascending == self.forward {
@@ -368,7 +375,7 @@ impl Cursor {
                 BinaryOp::Lt
             };
             let (property_chain, field_type) =
-                make_property_chain(base_type, &[&axis.key.field_name])?;
+                make_property_chain(base_type, &[&axis.key.field_name], type_system)?;
             let literal = json_to_literal(&field_type, &axis.value)
                 .context("Failed to convert axis value to literal")?;
 
@@ -415,13 +422,17 @@ fn json_to_literal(field_type: &Type, value: &serde_json::Value) -> Result<Expr>
 }
 
 /// Parses all CRUD query-string filters over `base_type` from provided `url`.
-fn url_to_filter(base_type: &Arc<ObjectType>, url: &str) -> Result<Option<Expr>> {
+fn url_to_filter(
+    base_type: &Arc<ObjectType>,
+    url: &str,
+    type_system: &TypeSystem,
+) -> Result<Option<Expr>> {
     let mut filter = None;
     let q = Url::parse(url).with_context(|| format!("failed to parse query string '{}'", url))?;
     for (param_key, value) in q.query_pairs().into_owned() {
         let param_key = param_key.to_string();
         if let Some(param_key) = param_key.strip_prefix('.') {
-            let expression = filter_from_param(base_type, param_key, &value)
+            let expression = filter_from_param(base_type, param_key, &value, type_system)
                 .context("failed to parse filter")?;
 
             filter = filter
@@ -457,7 +468,12 @@ fn parse_sort(base_type: &Arc<ObjectType>, value: &str) -> Result<SortBy> {
 }
 
 /// Constructs results filter by parsing query string's `param_key` and `value`.
-fn filter_from_param(base_type: &Arc<ObjectType>, param_key: &str, value: &str) -> Result<Expr> {
+fn filter_from_param(
+    base_type: &Arc<ObjectType>,
+    param_key: &str,
+    value: &str,
+    type_system: &TypeSystem,
+) -> Result<Expr> {
     let tokens: Vec<_> = param_key.split('~').collect();
     anyhow::ensure!(
         tokens.len() <= 2,
@@ -468,7 +484,7 @@ fn filter_from_param(base_type: &Arc<ObjectType>, param_key: &str, value: &str) 
     let operator = tokens.get(1).copied();
     let operator = convert_operator(operator)?;
 
-    let (property_chain, field_type) = make_property_chain(base_type, &fields)?;
+    let (property_chain, field_type) = make_property_chain(base_type, &fields, type_system)?;
 
     let err_msg = |ty_name| format!("failed to convert filter value '{}' to {}", value, ty_name);
     let literal = match field_type {
@@ -487,7 +503,11 @@ fn filter_from_param(base_type: &Arc<ObjectType>, param_key: &str, value: &str) 
 
 /// Converts `fields` of `base_type` into PropertyAccess expression while ensuring that
 /// provided fields are, in fact, applicable to `base_type`.
-fn make_property_chain(base_type: &Arc<ObjectType>, fields: &[&str]) -> Result<(Expr, Type)> {
+fn make_property_chain(
+    base_type: &Arc<ObjectType>,
+    fields: &[&str],
+    type_system: &TypeSystem,
+) -> Result<(Expr, Type)> {
     anyhow::ensure!(
         !fields.is_empty(),
         "cannot make property chain from no fields"
@@ -497,7 +517,7 @@ fn make_property_chain(base_type: &Arc<ObjectType>, fields: &[&str]) -> Result<(
     for &field_str in fields {
         if let Type::Object(entity) = last_type {
             if let Some(field) = entity.get_field(field_str) {
-                last_type = field.type_.clone();
+                last_type = type_system.lookup_type(&field.type_.name(), &entity.api_version)?;
             } else {
                 anyhow::bail!(
                     "entity '{}' doesn't have field '{}'",
@@ -698,8 +718,9 @@ mod tests {
                 make_field("ceo", Type::Object(person_type)),
             ],
         );
+
         let filter_expr =
-            |key: &str, value: &str| filter_from_param(&base_type, key, value).unwrap();
+            |key: &str, value: &str| filter_from_param(&base_type, key, value, &TS).unwrap();
         let ops = [
             (BinaryOp::Eq, ""),
             (BinaryOp::NotEq, "~ne"),
@@ -748,8 +769,13 @@ mod tests {
         }
     }
 
-    async fn run_query(entity_name: &str, url: Url, qe: &QueryEngine) -> Result<JsonObject> {
-        run_query_with_headers(entity_name, url, qe, HashMap::default()).await
+    async fn run_query(
+        entity_name: &str,
+        url: Url,
+        qe: &QueryEngine,
+        type_system: &TypeSystem,
+    ) -> Result<JsonObject> {
+        run_query_with_headers(entity_name, url, qe, HashMap::default(), type_system).await
     }
 
     async fn run_query_with_headers(
@@ -757,6 +783,7 @@ mod tests {
         url: Url,
         qe: &QueryEngine,
         headers: HashMap<String, String>,
+        type_system: &TypeSystem,
     ) -> Result<JsonObject> {
         let qe = Arc::new(qe.clone());
         let tr = qe.clone().start_transaction_static().await.unwrap();
@@ -775,12 +802,18 @@ mod tests {
             },
             qe,
             tr,
+            type_system,
         )
         .await
     }
 
-    async fn run_query_vec(entity_name: &str, url: Url, qe: &QueryEngine) -> Vec<String> {
-        let r = run_query(entity_name, url, qe).await.unwrap();
+    async fn run_query_vec(
+        entity_name: &str,
+        url: Url,
+        qe: &QueryEngine,
+        type_system: &TypeSystem,
+    ) -> Vec<String> {
+        let r = run_query(entity_name, url, qe, type_system).await.unwrap();
         collect_names(&r)
     }
 
@@ -801,56 +834,56 @@ mod tests {
 
         let (query_engine, _db_file) = setup_clear_db(&*ENTITIES).await;
         let qe = &query_engine;
-        add_row(qe, &PERSON_TY, &alan).await;
-        add_row(qe, &PERSON_TY, &john).await;
-        add_row(qe, &PERSON_TY, &steve).await;
+        add_row(qe, &PERSON_TY, &alan, &TS).await;
+        add_row(qe, &PERSON_TY, &john, &TS).await;
+        add_row(qe, &PERSON_TY, &steve, &TS).await;
 
-        let mut r = run_query_vec("Person", url(""), qe).await;
+        let mut r = run_query_vec("Person", url(""), qe, &TS).await;
         r.sort();
         assert_eq!(r, vec!["Alan", "John", "Steve"]);
 
-        let r = run_query_vec("Person", url("limit=2"), qe).await;
+        let r = run_query_vec("Person", url("limit=2"), qe, &TS).await;
         assert_eq!(r.len(), 2);
 
-        let r = run_query_vec("Person", url("page_size=2"), qe).await;
+        let r = run_query_vec("Person", url("page_size=2"), qe, &TS).await;
         assert_eq!(r.len(), 2);
 
         // Test Sorting
-        let r = run_query_vec("Person", url("sort=age"), qe).await;
+        let r = run_query_vec("Person", url("sort=age"), qe, &TS).await;
         assert_eq!(r, vec!["John", "Steve", "Alan"]);
 
-        let r = run_query_vec("Person", url("sort=%2Bage"), qe).await;
+        let r = run_query_vec("Person", url("sort=%2Bage"), qe, &TS).await;
         assert_eq!(r, vec!["John", "Steve", "Alan"]);
 
-        let r = run_query_vec("Person", url("sort=-age"), qe).await;
+        let r = run_query_vec("Person", url("sort=-age"), qe, &TS).await;
         assert_eq!(r, vec!["Alan", "Steve", "John"]);
 
         // Test Offset
-        let r = run_query_vec("Person", url("sort=name&offset=1"), qe).await;
+        let r = run_query_vec("Person", url("sort=name&offset=1"), qe, &TS).await;
         assert_eq!(r, vec!["John", "Steve"]);
 
         // Test filtering
-        let r = run_query_vec("Person", url(".age=10"), qe).await;
+        let r = run_query_vec("Person", url(".age=10"), qe, &TS).await;
         assert_eq!(r, Vec::<String>::new());
 
-        let r = run_query_vec("Person", url(".age=29"), qe).await;
+        let r = run_query_vec("Person", url(".age=29"), qe, &TS).await;
         assert_eq!(r, vec!["Steve"]);
 
-        let r = run_query_vec("Person", url(".age~lt=29&.name~like=%25n"), qe).await;
+        let r = run_query_vec("Person", url(".age~lt=29&.name~like=%25n"), qe, &TS).await;
         assert_eq!(r, vec!["John"]);
 
-        let mut r = run_query_vec("Person", url(".name~unlike=Al%25"), qe).await;
+        let mut r = run_query_vec("Person", url(".name~unlike=Al%25"), qe, &TS).await;
         r.sort();
         assert_eq!(r, vec!["John", "Steve"]);
 
         let alex = json!({"name": "Alex", "age": json!(40f32)});
-        add_row(qe, &PERSON_TY, &alex).await;
+        add_row(qe, &PERSON_TY, &alex, &TS).await;
         // Test permutations of parameters
         {
             let raw_ops = vec!["page_size=2", "offset=1", "sort=age"];
             for perm in raw_ops.iter().permutations(raw_ops.len()) {
                 let query_string = perm.iter().join("&");
-                let r = run_query_vec("Person", url(&query_string), qe).await;
+                let r = run_query_vec("Person", url(&query_string), qe, &TS).await;
                 assert_eq!(
                     r,
                     vec!["Steve", "Alan"],
@@ -861,7 +894,7 @@ mod tests {
             let raw_ops = vec!["page_size=2", "offset=1", "sort=name", ".age~gt=20"];
             for perm in raw_ops.iter().permutations(raw_ops.len()) {
                 let query_string = perm.iter().join("&");
-                let r = run_query_vec("Person", url(&query_string), qe).await;
+                let r = run_query_vec("Person", url(&query_string), qe, &TS).await;
                 assert_eq!(
                     r,
                     vec!["Alex", "Steve"],
@@ -880,10 +913,10 @@ mod tests {
 
         let (query_engine, _db_file) = setup_clear_db(&*ENTITIES).await;
         let qe = &query_engine;
-        add_row(qe, &PERSON_TY, &alan).await;
-        add_row(qe, &PERSON_TY, &john).await;
-        add_row(qe, &PERSON_TY, &steve).await;
-        add_row(qe, &PERSON_TY, &alex).await;
+        add_row(qe, &PERSON_TY, &alan, &TS).await;
+        add_row(qe, &PERSON_TY, &john, &TS).await;
+        add_row(qe, &PERSON_TY, &steve, &TS).await;
+        add_row(qe, &PERSON_TY, &alex, &TS).await;
 
         fn get_url(raw: &serde_json::Value) -> Url {
             Url::parse(raw.as_str().unwrap()).unwrap()
@@ -891,7 +924,7 @@ mod tests {
 
         // Simple forward step.
         {
-            let r = run_query("Person", url("sort=name&page_size=2"), qe)
+            let r = run_query("Person", url("sort=name&page_size=2"), qe, &TS)
                 .await
                 .unwrap();
             let names = collect_names(&r);
@@ -899,14 +932,14 @@ mod tests {
 
             assert!(r.contains_key("next_page"));
             let next_page = get_url(&r["next_page"]);
-            let r = run_query("Person", next_page, qe).await.unwrap();
+            let r = run_query("Person", next_page, qe, &TS).await.unwrap();
             let names = collect_names(&r);
             assert_eq!(names, vec!["John", "Steve"]);
         }
 
         // Empty pre-first page loop
         {
-            let r = run_query("Person", url("sort=name&page_size=1"), qe)
+            let r = run_query("Person", url("sort=name&page_size=1"), qe, &TS)
                 .await
                 .unwrap();
             let names = collect_names(&r);
@@ -915,20 +948,24 @@ mod tests {
             assert!(r.contains_key("prev_page"));
             let prev_page = get_url(&r["prev_page"]);
 
-            let r = run_query("Person", prev_page.clone(), qe).await.unwrap();
+            let r = run_query("Person", prev_page.clone(), qe, &TS)
+                .await
+                .unwrap();
             let names = collect_names(&r);
             assert!(names.is_empty());
 
             assert!(r.contains_key("next_page"));
             let first_page = get_url(&r["next_page"]);
-            let r = run_query("Person", first_page.clone(), qe).await.unwrap();
+            let r = run_query("Person", first_page.clone(), qe, &TS)
+                .await
+                .unwrap();
             let names = collect_names(&r);
             assert_eq!(names, vec!["Alan"]);
         }
 
         // Empty last page loop
         {
-            let r = run_query("Person", url("sort=name&page_size=4"), qe)
+            let r = run_query("Person", url("sort=name&page_size=4"), qe, &TS)
                 .await
                 .unwrap();
             let names = collect_names(&r);
@@ -937,13 +974,17 @@ mod tests {
             assert!(r.contains_key("next_page"));
             let next_page = get_url(&r["next_page"]);
 
-            let r = run_query("Person", next_page.clone(), qe).await.unwrap();
+            let r = run_query("Person", next_page.clone(), qe, &TS)
+                .await
+                .unwrap();
             let names = collect_names(&r);
             assert!(names.is_empty());
 
             assert!(r.contains_key("prev_page"));
             let last_page = get_url(&r["prev_page"]);
-            let r = run_query("Person", last_page.clone(), qe).await.unwrap();
+            let r = run_query("Person", last_page.clone(), qe, &TS)
+                .await
+                .unwrap();
             let names = collect_names(&r);
             assert_eq!(names, vec!["Alan", "Alex", "John", "Steve"]);
         }
@@ -956,7 +997,9 @@ mod tests {
         ) -> Vec<String> {
             let mut all_names = vec![];
             for i in 0..n_steps {
-                let r = run_query("Person", page_url.clone(), qe).await.unwrap();
+                let r = run_query("Person", page_url.clone(), qe, &TS)
+                    .await
+                    .unwrap();
 
                 // Check backward cursors
                 if i == 0 {
@@ -965,7 +1008,9 @@ mod tests {
                     // Check that previous page returns the same results as
                     // before using next_page.
                     let prev_page = get_url(&r["prev_page"]);
-                    let r = run_query("Person", prev_page.clone(), qe).await.unwrap();
+                    let r = run_query("Person", prev_page.clone(), qe, &TS)
+                        .await
+                        .unwrap();
                     let prev_names = collect_names(&r);
                     assert_eq!(prev_names.len(), page_size);
                     assert_eq!(prev_names, all_names[all_names.len() - page_size..]);
@@ -978,7 +1023,9 @@ mod tests {
                     if i == 1 {
                         // We go from the second page to first and beyond to an empty page.
                         let prev_page = get_url(&r["prev_page"]);
-                        let r = run_query("Person", prev_page.clone(), qe).await.unwrap();
+                        let r = run_query("Person", prev_page.clone(), qe, &TS)
+                            .await
+                            .unwrap();
                         assert!(r.contains_key("next_page"));
                     }
                 }
@@ -1006,7 +1053,7 @@ mod tests {
             assert_eq!(all_names, vec!["Alan", "Alex", "John", "Steve"]);
         }
         {
-            let r = run_query("Person", url("sort=name&page_size=5"), qe)
+            let r = run_query("Person", url("sort=name&page_size=5"), qe, &TS)
                 .await
                 .unwrap();
 
@@ -1021,7 +1068,7 @@ mod tests {
                 "host".to_string(),
                 "myhost.com:666".to_string(),
             )]);
-            let r = run_query_with_headers("Person", url("page_size=1"), qe, headers)
+            let r = run_query_with_headers("Person", url("page_size=1"), qe, headers, &TS)
                 .await
                 .unwrap();
             let next_page = r["next_page"].as_str().unwrap();
@@ -1034,30 +1081,54 @@ mod tests {
         let (query_engine, _db_file) = setup_clear_db(&*ENTITIES).await;
         let qe = &query_engine;
 
-        assert!(run_query("Person", url("limit=two"), qe).await.is_err());
-        assert!(run_query("Person", url("limit=true"), qe).await.is_err());
-
-        assert!(run_query("Person", url("offset=two"), qe).await.is_err());
-        assert!(run_query("Person", url("offset=true"), qe).await.is_err());
-
-        assert!(run_query("Person", url("sort=age1"), qe).await.is_err());
-        assert!(run_query("Person", url("sort=%2Bnotname"), qe)
+        assert!(run_query("Person", url("limit=two"), qe, &TS)
             .await
             .is_err());
-        assert!(run_query("Person", url("sort=-notname"), qe).await.is_err());
-        assert!(run_query("Person", url("sort=--age"), qe).await.is_err());
-        assert!(run_query("Person", url("sort=age aa"), qe).await.is_err());
-
-        assert!(run_query("Person", url(".agex=4"), qe).await.is_err());
-        assert!(run_query("Person", url("..age=4"), qe).await.is_err());
-        assert!(run_query("Person", url(".age=four"), qe).await.is_err());
-        assert!(run_query("Person", url(".age=true"), qe).await.is_err());
-        assert!(run_query("Person", url(".age~ltt=4"), qe).await.is_err());
-        assert!(run_query("Person", url(".age~neq~lt=4"), qe).await.is_err());
-        assert!(run_query("Person", url(".age.nothing=4"), qe)
+        assert!(run_query("Person", url("limit=true"), qe, &TS)
             .await
             .is_err());
-        assert!(run_query("Person", url(".=123"), qe).await.is_err());
+
+        assert!(run_query("Person", url("offset=two"), qe, &TS)
+            .await
+            .is_err());
+        assert!(run_query("Person", url("offset=true"), qe, &TS)
+            .await
+            .is_err());
+
+        assert!(run_query("Person", url("sort=age1"), qe, &TS)
+            .await
+            .is_err());
+        assert!(run_query("Person", url("sort=%2Bnotname"), qe, &TS)
+            .await
+            .is_err());
+        assert!(run_query("Person", url("sort=-notname"), qe, &TS)
+            .await
+            .is_err());
+        assert!(run_query("Person", url("sort=--age"), qe, &TS)
+            .await
+            .is_err());
+        assert!(run_query("Person", url("sort=age aa"), qe, &TS)
+            .await
+            .is_err());
+
+        assert!(run_query("Person", url(".agex=4"), qe, &TS).await.is_err());
+        assert!(run_query("Person", url("..age=4"), qe, &TS).await.is_err());
+        assert!(run_query("Person", url(".age=four"), qe, &TS)
+            .await
+            .is_err());
+        assert!(run_query("Person", url(".age=true"), qe, &TS)
+            .await
+            .is_err());
+        assert!(run_query("Person", url(".age~ltt=4"), qe, &TS)
+            .await
+            .is_err());
+        assert!(run_query("Person", url(".age~neq~lt=4"), qe, &TS)
+            .await
+            .is_err());
+        assert!(run_query("Person", url(".age.nothing=4"), qe, &TS)
+            .await
+            .is_err());
+        assert!(run_query("Person", url(".=123"), qe, &TS).await.is_err());
     }
 
     #[tokio::test]
@@ -1078,6 +1149,7 @@ mod tests {
                 },
                 entity_name,
                 url,
+                &TS,
             )
             .unwrap()
         };
@@ -1086,7 +1158,7 @@ mod tests {
         let alan = json!({"name": "Alan", "age": json!(30f32)});
         {
             let (qe, _db_file) = setup_clear_db(&*ENTITIES).await;
-            add_row(&qe, &PERSON_TY, &john).await;
+            add_row(&qe, &PERSON_TY, &john, &TS).await;
 
             let mutation = delete_from_url("Person", &url(".name=John"));
             qe.mutate(mutation).await.unwrap();
@@ -1095,8 +1167,8 @@ mod tests {
         }
         {
             let (qe, _db_file) = setup_clear_db(&*ENTITIES).await;
-            add_row(&qe, &PERSON_TY, &john).await;
-            add_row(&qe, &PERSON_TY, &alan).await;
+            add_row(&qe, &PERSON_TY, &john, &TS).await;
+            add_row(&qe, &PERSON_TY, &alan, &TS).await;
 
             let mutation = delete_from_url("Person", &url(".age=30"));
             qe.mutate(mutation).await.unwrap();
@@ -1109,7 +1181,7 @@ mod tests {
         let chiselstrike = json!({"name": "ChiselStrike", "ceo": john});
         {
             let (qe, _db_file) = setup_clear_db(&*ENTITIES).await;
-            add_row(&qe, &COMPANY_TY, &chiselstrike).await;
+            add_row(&qe, &COMPANY_TY, &chiselstrike, &TS).await;
 
             let mutation = delete_from_url("Company", &url(".ceo.name=John"));
             qe.mutate(mutation).await.unwrap();
