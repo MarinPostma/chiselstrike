@@ -4,7 +4,7 @@
 extern crate log;
 
 use anyhow::Result;
-use chisel_server::server;
+use chisel_server::server::{self, Opt};
 use env_logger::Env;
 use log::LevelFilter;
 use nix::unistd::execv;
@@ -12,14 +12,6 @@ use server::DoRepeat;
 use std::env;
 use std::ffi::CString;
 use std::io::Write;
-use std::path::PathBuf;
-use structopt::StructOpt;
-
-fn find_default_config_path() -> Option<PathBuf> {
-    let config_dir = dirs::config_dir()?.join("chiselstrike");
-    let config_path = config_dir.join("config.toml");
-    config_path.exists().then(|| config_path)
-}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -39,19 +31,7 @@ async fn main() -> Result<()> {
     let args: Vec<CString> = env::args().map(|x| CString::new(x).unwrap()).collect();
     let exe = env::current_exe()?.into_os_string().into_string().unwrap();
 
-    let opt = {
-        let default_path = find_default_config_path();
-        let opt = match default_path {
-            Some(ref path) => server::Opt::from_file(path).await?,
-            None => server::Opt::from_args(),
-        };
-
-        match opt.config {
-            Some(ref path) => server::Opt::from_file(path).await?,
-            None => opt,
-        }
-    };
-
+    let opt = Opt::get_opt(std::env::args()).await?;
     if let DoRepeat::Yes = server::run_all(opt).await? {
         info!("Restarting");
         execv(&CString::new(exe).unwrap(), &args).unwrap();

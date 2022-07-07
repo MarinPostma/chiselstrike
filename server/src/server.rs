@@ -25,11 +25,13 @@ use futures::FutureExt;
 use futures::StreamExt;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
+use structopt::clap::ArgMatches;
 use structopt::StructOpt;
 use structopt_toml::StructOptToml;
 use tokio::task::JoinHandle;
@@ -75,12 +77,38 @@ pub struct Opt {
     pub config: Option<PathBuf>,
 }
 
+fn find_default_config_path() -> Option<PathBuf> {
+    let config_dir = dirs::config_dir()?.join("chiselstrike");
+    let config_path = config_dir.join("config.toml");
+    config_path.exists().then(|| config_path)
+}
+
 impl Opt {
-    pub async fn from_file(path: &Path) -> Result<Self> {
+    async fn from_file(path: &Path, args: &ArgMatches<'_>) -> Result<Self> {
         let content = tokio::fs::read(path).await?;
         let content = std::str::from_utf8(&content)?;
 
-        Self::from_args_with_toml(content).map_err(|e| anyhow::anyhow!(e.to_string()))
+        Self::from_clap_with_toml(content, args).map_err(|e| anyhow::anyhow!(e.to_string()))
+    }
+
+    pub async fn get_opt<I, S>(args: I) -> Result<Opt>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<OsString> + Clone,
+    {
+        let app = Opt::clap();
+        let arg_matches = app.get_matches_from(args);
+
+        let default_path = dbg!(find_default_config_path());
+        let opt = match default_path {
+            Some(ref path) => Opt::from_file(path, &arg_matches).await?,
+            None => Opt::from_clap(&arg_matches),
+        };
+
+        match opt.config {
+            Some(ref path) => Opt::from_file(path, &arg_matches).await,
+            None => Ok(opt),
+        }
     }
 }
 
@@ -455,4 +483,133 @@ pub async fn run_all(opt: Opt) -> Result<DoRepeat> {
     }
 
     tasks.join().await
+}
+
+#[cfg(test)]
+mod test {
+    use std::io::Write;
+
+    use super::*;
+
+    #[cfg(unix)]
+    fn isolate(f: impl FnOnce()) {
+        use std::process::exit;
+
+        use nix::{
+            sys::wait::waitpid,
+            unistd::{fork, ForkResult},
+        };
+
+        match unsafe { fork().unwrap() } {
+            ForkResult::Parent { child } => loop {
+                dbg!();
+                match waitpid(child, None).unwrap() {
+                    nix::sys::wait::WaitStatus::Exited(_, status) => {
+                        dbg!(status);
+                        if status == 0 {
+                            return;
+                        } else {
+                            // TODO: return child stdout/err for nice error messaged
+                            panic!("test failed");
+                        }
+                    }
+                    _ => (),
+                }
+            },
+            ForkResult::Child => {
+                f();
+                exit(0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn read_opt_from_file() {
+        let content = r#"
+api_listen_addr = "192.255.123.0"
+rpc_listen_addr = "192.232.121.2:8007"
+internal_routes_listen_addr = "243.144.123.1:1743"
+db_uri = "theurl"
+inspect_brk = false
+nr_connections = 666
+executor_threads = 321"#;
+
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(content.as_bytes()).unwrap();
+
+        let app = Opt::clap();
+        let args = app
+            .get_matches_from_safe(std::iter::empty::<OsString>())
+            .unwrap();
+        let opt = Opt::from_file(tmp.path(), &args).await.unwrap();
+
+        assert_eq!(opt.api_listen_addr, "192.255.123.0");
+        assert_eq!(opt.nr_connections, 666);
+        assert_eq!(opt.executor_threads, 321);
+        assert_eq!(opt.db_uri, "theurl");
+        assert_eq!(
+            opt.rpc_listen_addr,
+            "192.232.121.2:8007".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            opt.internal_routes_listen_addr,
+            "243.144.123.1:1743".parse::<SocketAddr>().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn cant_set_file_in_config() {
+        let content = r#"config = "my_config.toml""#;
+
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(content.as_bytes()).unwrap();
+
+        let app = Opt::clap();
+        let args = app
+            .get_matches_from_safe(std::iter::empty::<OsString>())
+            .unwrap();
+        assert!(Opt::from_file(tmp.path(), &args).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn read_config_pointed_by_cli_arg() {
+        let content = r#"executor_threads = 11111"#;
+
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(content.as_bytes()).unwrap();
+
+        let opt = Opt::get_opt(["", "-c", &tmp.path().display().to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(opt.executor_threads, 11111);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn default_config_file() {
+        isolate(|| {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            runtime.block_on(async {
+                let content = r#"
+api_listen_addr = "192.255.123.0"
+executor_threads = 321"#;
+
+                let tmp = tempfile::tempdir().unwrap();
+                let config_dir_path = tmp.path().join("chiselstrike");
+                std::fs::create_dir_all(&config_dir_path).unwrap();
+
+                let config_file_path = config_dir_path.join("config.toml");
+                let mut file = std::fs::File::create(config_file_path).unwrap();
+                file.write_all(content.as_bytes()).unwrap();
+
+                std::env::set_var("XDG_CONFIG_HOME", tmp.path());
+
+                let opt = Opt::get_opt(std::iter::empty::<OsString>()).await.unwrap();
+
+                assert_eq!(opt.api_listen_addr, "192.255.123.0");
+                assert_eq!(opt.executor_threads, 321);
+            });
+        });
+    }
 }
