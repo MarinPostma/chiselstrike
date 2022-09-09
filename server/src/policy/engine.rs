@@ -1,4 +1,6 @@
 use std::cell::{Ref, RefCell};
+use std::collections::hash_map::Entry;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -205,33 +207,39 @@ impl Filter {
 /// instance.
 #[allow(dead_code)]
 pub struct PolicyEvalInstance {
-    read_filter: Option<Filter>,
-    write_filter: Option<Filter>,
+    filters: HashMap<FilterName, Filter>,
     chisel_ctx: ChiselRequestContext,
     ty_name: String,
     version: String,
 }
 
+#[derive(PartialEq, Eq, Hash, Clone, Copy)]
+enum FilterName {
+    Read,
+}
+
 impl PolicyEvalInstance {
     pub fn new(ty_name: String, version: String, chisel_ctx: ChiselRequestContext) -> Self {
         Self {
-            read_filter: None,
-            write_filter: None,
+            filters: Default::default(),
             chisel_ctx,
             ty_name,
             version,
         }
     }
 
-    fn get_or_load_read_filter(&mut self, engine: &PolicyEngine) -> Result<Option<&Filter>> {
-        match self.read_filter {
-            Some(ref filter) => Ok(Some(filter)),
-            None => {
+    fn get_or_load_filter(
+        &mut self,
+        engine: &PolicyEngine,
+        filter: FilterName,
+    ) -> Result<Option<&Filter>> {
+        match self.filters.entry(filter) {
+            Entry::Occupied(e) => Ok(Some(e.into_mut())),
+            Entry::Vacant(e) => {
                 if let Some(tp) = engine.get_policy(&self.version, &self.ty_name) {
                     if let Some(ref p) = tp.policies.read {
                         let filter = Filter::new(&self.chisel_ctx, p, engine.eval_context.clone())?;
-                        self.read_filter.replace(filter);
-                        return Ok(self.read_filter.as_ref());
+                        return Ok(Some(e.insert(filter)));
                     }
                 }
                 Ok(None)
@@ -240,7 +248,7 @@ impl PolicyEvalInstance {
     }
 
     pub fn make_read_filter_expr(&mut self, engine: &PolicyEngine) -> Result<Option<Expr>> {
-        self.get_or_load_read_filter(engine)?
+        self.get_or_load_filter(engine, FilterName::Read)?
             .and_then(|f| f.get_fitler_expr().transpose())
             .transpose()
     }
@@ -251,7 +259,7 @@ impl PolicyEvalInstance {
         entity: &Entity,
         val: &serde_json::Map<String, JsonValue>,
     ) -> Result<Option<Action>> {
-        self.get_or_load_read_filter(engine)?
+        self.get_or_load_filter(engine, FilterName::Read)?
             .map(|f| f.get_action(entity, val))
             .transpose()
     }
