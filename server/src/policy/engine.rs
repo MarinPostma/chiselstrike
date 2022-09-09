@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use anyhow::{bail, Result};
 use chiselc::policies::{
-    Actions, Cond, Policy, PolicyEvalContext, Predicate, Predicates, Values, Var,
+    Actions, Cond, Policy, PolicyEvalContext, PolicyName, Predicate, Predicates, Values, Var,
 };
 use serde_json::Value as JsonValue;
 
@@ -27,6 +27,15 @@ pub enum Action {
     Deny,
     Skip,
     Log,
+}
+
+impl Action {
+    fn is_restrictive(&self) -> bool {
+        match self {
+            Action::Deny | Action::Skip => true,
+            Action::Allow | Action::Log => false,
+        }
+    }
 }
 
 impl From<chiselc::policies::Action> for Action {
@@ -216,6 +225,16 @@ pub struct PolicyEvalInstance {
 #[derive(PartialEq, Eq, Hash, Clone, Copy)]
 enum FilterName {
     Read,
+    Create,
+}
+
+impl Into<PolicyName> for FilterName {
+    fn into(self) -> PolicyName {
+        match self {
+            FilterName::Read => PolicyName::Read,
+            FilterName::Create => PolicyName::Create,
+        }
+    }
 }
 
 impl PolicyEvalInstance {
@@ -237,7 +256,7 @@ impl PolicyEvalInstance {
             Entry::Occupied(e) => Ok(Some(e.into_mut())),
             Entry::Vacant(e) => {
                 if let Some(tp) = engine.get_policy(&self.version, &self.ty_name) {
-                    if let Some(ref p) = tp.policies.read {
+                    if let Some(ref p) = tp.policies.get(filter.into()) {
                         let filter = Filter::new(&self.chisel_ctx, p, engine.eval_context.clone())?;
                         return Ok(Some(e.insert(filter)));
                     }
@@ -262,6 +281,21 @@ impl PolicyEvalInstance {
         self.get_or_load_filter(engine, FilterName::Read)?
             .map(|f| f.get_action(entity, val))
             .transpose()
+    }
+
+    pub fn get_create_action(
+        &mut self,
+        engine: &PolicyEngine,
+        entity: &Entity,
+        val: &serde_json::Map<String, JsonValue>,
+    ) -> Result<Option<Action>> {
+        match self.get_read_action(engine, entity, val)? {
+            Some(action) if action.is_restrictive() => Ok(Some(action)),
+            _ => self
+                .get_or_load_filter(engine, FilterName::Create)?
+                .map(|f| f.get_action(entity, val))
+                .transpose(),
+        }
     }
 }
 

@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
 use std::ops::{Deref, DerefMut};
+use std::str::FromStr;
 use std::sync::Arc;
 
 use anyhow::{bail, Result};
@@ -18,10 +19,27 @@ use crate::tools::analysis::d_ir::{EnrichedRegion, EnrichedRegionInner};
 use crate::tools::analysis::stmt_map::StmtMap;
 use crate::tools::functions::ArrowFunction;
 
+#[derive(PartialEq, Eq, Hash, Clone, Copy, Debug)]
+pub enum PolicyName {
+    Read,
+    Create,
+}
+
+impl FromStr for PolicyName {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "read" => Ok(Self::Read),
+            "create" => Ok(Self::Create),
+            other => bail!("unknown policy `{other}`"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Policies {
-    pub read: Option<Policy>,
-    pub write: Option<Policy>,
+    policies: HashMap<PolicyName, Policy>,
 }
 
 pub trait Type<'a> {
@@ -35,8 +53,7 @@ pub trait TypeSystem {
 
 impl Policies {
     pub fn parse(module: &Module, ts: &impl TypeSystem) -> Self {
-        let mut read = None;
-        let mut write = None;
+        let mut policies = HashMap::new();
 
         match &module.body[0] {
             ModuleItem::ModuleDecl(m) => match m {
@@ -54,14 +71,12 @@ impl Policies {
                                             _ => todo!(),
                                         };
 
-                                        match &kv.key {
-                                            PropName::Ident(id) => match &*id.sym {
-                                                "read" => read.replace(body),
-                                                "write" => write.replace(body),
-                                                _ => todo!("unexpected policy rule"),
-                                            },
+                                        let policy_name = match &kv.key {
+                                            PropName::Ident(id) => id.sym.parse().unwrap(),
                                             _ => todo!(),
                                         };
+
+                                        policies.insert(policy_name, body);
                                     }
                                     _ => todo!(),
                                 },
@@ -76,7 +91,11 @@ impl Policies {
             ModuleItem::Stmt(_) => todo!(),
         };
 
-        Self { read, write }
+        Self { policies }
+    }
+
+    pub fn get(&self, name: PolicyName) -> Option<&Policy> {
+        self.policies.get(&name)
     }
 }
 
